@@ -2,13 +2,94 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
 
 REQUIRED_DATA = ["p", "Np", "Gp", "Bo", "Bg", "Rs"]
 REQUIRED_PARAMS = ["pi", "Boi", "Bgi", "Rsi", "Swc", "Cw", "Cf"]
+
+
+# All calculations are performed internally using these canonical units:
+# p, pi: psi; Np: STB; Gp: scf; Bo/Boi: rb/STB; Bg/Bgi: rb/scf;
+# Rs/Rsi: scf/STB; Swc: fraction; Cw/Cf: psi^-1.
+FT3_PER_RB = 5.614583333333333
+PSI_PER_KPA = 0.14503773773020923
+PSI_PER_MPA = 145.03773773020923
+PSI_PER_BAR = 14.503773773020923
+
+UNIT_FACTORS = {
+    "p": {"psi": 1.0, "kPa": PSI_PER_KPA, "MPa": PSI_PER_MPA, "bar": PSI_PER_BAR},
+    "pi": {"psi": 1.0, "kPa": PSI_PER_KPA, "MPa": PSI_PER_MPA, "bar": PSI_PER_BAR},
+    "Np": {"STB": 1.0, "MSTB": 1e3, "MMSTB": 1e6},
+    "Gp": {"scf": 1.0, "Mscf": 1e3, "MMscf": 1e6, "Bscf / MMMSCF (10⁹ scf)": 1e9},
+    "Bo": {"rb/STB": 1.0, "bbl/STB": 1.0, "ft³/STB": 1.0 / FT3_PER_RB},
+    "Boi": {"rb/STB": 1.0, "bbl/STB": 1.0, "ft³/STB": 1.0 / FT3_PER_RB},
+    "Bg": {
+        "rb/scf": 1.0,
+        "ft³/scf": 1.0 / FT3_PER_RB,
+        "rb/Mscf": 1.0 / 1e3,
+        "ft³/Mscf": 1.0 / FT3_PER_RB / 1e3,
+    },
+    "Bgi": {
+        "rb/scf": 1.0,
+        "ft³/scf": 1.0 / FT3_PER_RB,
+        "rb/Mscf": 1.0 / 1e3,
+        "ft³/Mscf": 1.0 / FT3_PER_RB / 1e3,
+    },
+    "Rs": {"scf/STB": 1.0, "Mscf/STB": 1e3},
+    "Rsi": {"scf/STB": 1.0, "Mscf/STB": 1e3},
+    "Swc": {"fraction (0–1)": 1.0, "percent (%)": 0.01},
+    # Convert a value expressed per selected pressure unit to per psi.
+    "Cw": {
+        "psi⁻¹": 1.0,
+        "kPa⁻¹": 1.0 / PSI_PER_KPA,
+        "MPa⁻¹": 1.0 / PSI_PER_MPA,
+        "bar⁻¹": 1.0 / PSI_PER_BAR,
+    },
+    "Cf": {
+        "psi⁻¹": 1.0,
+        "kPa⁻¹": 1.0 / PSI_PER_KPA,
+        "MPa⁻¹": 1.0 / PSI_PER_MPA,
+        "bar⁻¹": 1.0 / PSI_PER_BAR,
+    },
+}
+
+DEFAULT_INPUT_UNITS = {
+    "p": "psi", "Np": "STB", "Gp": "scf", "Bo": "rb/STB", "Bg": "rb/scf", "Rs": "scf/STB",
+    "pi": "psi", "Boi": "rb/STB", "Bgi": "rb/scf", "Rsi": "scf/STB",
+    "Swc": "fraction (0–1)", "Cw": "psi⁻¹", "Cf": "psi⁻¹",
+}
+
+
+def normalize_input_units(input_units: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Return a complete unit selection, filling omitted keys with canonical defaults."""
+    units = dict(DEFAULT_INPUT_UNITS)
+    if input_units:
+        units.update(input_units)
+    for key, unit in units.items():
+        if key not in UNIT_FACTORS or unit not in UNIT_FACTORS[key]:
+            allowed = ", ".join(UNIT_FACTORS.get(key, {}).keys())
+            raise ValueError(f"Unsupported unit '{unit}' for {key}. Choose one of: {allowed}.")
+    return units
+
+
+def convert_inputs_to_canonical(
+    production: pd.DataFrame,
+    params: Dict[str, float],
+    input_units: Optional[Dict[str, str]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, float], Dict[str, str]]:
+    """Convert all supplied production and initial-parameter values to canonical units."""
+    units = normalize_input_units(input_units)
+    df = production.copy()
+    for key in REQUIRED_DATA:
+        df[key] = pd.to_numeric(df[key], errors="coerce") * UNIT_FACTORS[key][units[key]]
+
+    canonical_params = dict(params)
+    for key in REQUIRED_PARAMS:
+        canonical_params[key] = float(canonical_params[key]) * UNIT_FACTORS[key][units[key]]
+    return df, canonical_params, units
 
 COLUMN_ALIASES = {
     "p": [
@@ -169,6 +250,7 @@ def calculate_havlena_odeh(
     params: Dict[str, float],
     gas_unit: str = "scf",
     include_compressibility: bool = True,
+    input_units: Optional[Dict[str, str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Calculate H–O variables and perform ordinary least-squares straight-line fit.
 
@@ -181,19 +263,30 @@ def calculate_havlena_odeh(
     the transformed equation linear in N and Nm. Water influx and produced water
     are not included because the requested input columns do not supply them.
     """
-    validate_parameters(params)
-    scales = {"scf": 1.0, "Mscf": 1_000.0, "MMscf": 1_000_000.0}
-    if gas_unit not in scales:
-        raise ValueError("Gas unit must be scf, Mscf, or MMscf.")
+    if input_units is not None:
+        df, canonical_params, selected_units = convert_inputs_to_canonical(production, params, input_units)
+        gas_scale = 1.0
+    else:
+        # Backward-compatible path for scripts/tests using the older Gp-only selector.
+        validate_parameters(params)
+        scales = {"scf": 1.0, "Mscf": 1_000.0, "MMscf": 1_000_000.0}
+        if gas_unit not in scales:
+            raise ValueError("Gas unit must be scf, Mscf, or MMscf.")
+        df = production.copy()
+        for col in REQUIRED_DATA:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        canonical_params = dict(params)
+        selected_units = dict(DEFAULT_INPUT_UNITS)
+        selected_units["Gp"] = gas_unit
+        gas_scale = scales[gas_unit]
 
-    df = production.copy().reset_index(drop=True)
-    for col in REQUIRED_DATA:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    validate_parameters(canonical_params)
+    df = df.reset_index(drop=True)
     df.insert(0, "Excel row", np.arange(2, len(df) + 2))
-    df["Gp_scf_used"] = df["Gp"] * scales[gas_unit]
+    df["Gp_scf_used"] = df["Gp"] * gas_scale
 
-    pi, Boi, Bgi, Rsi = (params[k] for k in ("pi", "Boi", "Bgi", "Rsi"))
-    Swc, Cw, Cf = (params[k] for k in ("Swc", "Cw", "Cf"))
+    pi, Boi, Bgi, Rsi = (canonical_params[k] for k in ("pi", "Boi", "Bgi", "Rsi"))
+    Swc, Cw, Cf = (canonical_params[k] for k in ("Swc", "Cw", "Cf"))
 
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         df["Rp_scf_per_STB"] = df["Gp_scf_used"] / df["Np"]
@@ -280,7 +373,8 @@ def calculate_havlena_odeh(
         "n_total": int(len(df)),
         "warnings": warnings,
         "include_compressibility": bool(include_compressibility),
-        "gas_unit_input": gas_unit,
-        "gas_scale_to_scf": scales[gas_unit],
+        "gas_unit_input": selected_units["Gp"],
+        "input_units": selected_units,
+        "gas_scale_to_scf": gas_scale,
     }
     return df, summary
