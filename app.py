@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import io
-import re
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from ho_engine import read_input_workbook, calculate_havlena_odeh
+from ho_engine import read_input_workbook, calculate_havlena_odeh, convert_inputs_to_canonical
 
 st.set_page_config(page_title="Havlena–Odeh Dashboard", page_icon="🛢️", layout="wide")
 
@@ -28,40 +24,88 @@ st.markdown(
 st.title("🛢️ Havlena–Odeh Material-Balance Dashboard")
 st.caption("Oil reservoir • gas-cap drive • straight-line interpretation")
 
+# The selectors define the units used by every numeric value in the corresponding
+# Excel column / parameter. The calculation engine converts all values to canonical
+# units before any material-balance term or regression is calculated.
 with st.sidebar:
     st.header("Input workbook")
     uploaded = st.file_uploader("Upload your Excel workbook (.xlsx)", type=["xlsx", "xlsm"])
     st.divider()
-    st.subheader("Input interpretation")
-    gas_unit = st.selectbox(
-        "Unit used by the Gp column",
-        ["scf", "Mscf", "MMscf"],
-        index=0,
-        help="Gp is converted to scf internally. Rs must be scf/STB and Bg must be rb/scf.",
-    )
+    st.subheader("Input units")
+    st.caption("Choose the units that are actually used in your Excel workbook. Each selection applies to the entire column or parameter.")
+
+    with st.expander("Production / PVT column units", expanded=True):
+        p_unit = st.selectbox("Average reservoir pressure, p", ["psi", "kPa", "MPa", "bar"], index=0)
+        np_unit = st.selectbox("Cumulative oil produced, Np", ["STB", "MSTB", "MMSTB"], index=0)
+        gp_unit = st.selectbox("Cumulative gas produced, Gp", ["scf", "Mscf", "MMscf", "Bscf / MMMSCF (10⁹ scf)"], index=0, help="Bscf / MMMSCF means 10^9 standard cubic feet.")
+        bo_unit = st.selectbox("Oil formation volume factor, Bo", ["rb/STB", "bbl/STB", "ft³/STB"], index=0)
+        bg_unit = st.selectbox("Gas formation volume factor, Bg", ["rb/scf", "ft³/scf", "rb/Mscf", "ft³/Mscf"], index=0)
+        rs_unit = st.selectbox("Solution gas-oil ratio, Rs", ["scf/STB", "Mscf/STB"], index=0)
+
+    with st.expander("Initial reservoir parameter units", expanded=True):
+        pi_unit = st.selectbox("Initial pressure, pi", ["psi", "kPa", "MPa", "bar"], index=0)
+        boi_unit = st.selectbox("Initial oil FVF, Boi", ["rb/STB", "bbl/STB", "ft³/STB"], index=0)
+        bgi_unit = st.selectbox("Initial gas FVF, Bgi", ["rb/scf", "ft³/scf", "rb/Mscf", "ft³/Mscf"], index=0)
+        rsi_unit = st.selectbox("Initial solution GOR, Rsi", ["scf/STB", "Mscf/STB"], index=0)
+        swc_unit = st.selectbox("Connate water saturation, Swc", ["fraction (0–1)", "percent (%)"], index=0)
+        cw_unit = st.selectbox("Water compressibility, Cw", ["psi⁻¹", "kPa⁻¹", "MPa⁻¹", "bar⁻¹"], index=0)
+        cf_unit = st.selectbox("Formation compressibility, Cf", ["psi⁻¹", "kPa⁻¹", "MPa⁻¹", "bar⁻¹"], index=0)
+
     use_compressibility = st.checkbox(
         "Include connate-water and formation compressibility",
         value=True,
-        help="Uses the supplied Swc, Cw, and Cf values in the H–O straight-line transform.",
+        help="Uses Swc, Cw, and Cf from the Initial_Parameters sheet after converting their selected units.",
     )
-    st.caption("Pressure must be in psi when Cw and Cf are in psi⁻¹.")
+    st.caption("Pressure and compressibility units are converted internally so that the pressure and Cw/Cf units are consistent.")
+
+input_units = {
+    "p": p_unit,
+    "Np": np_unit,
+    "Gp": gp_unit,
+    "Bo": bo_unit,
+    "Bg": bg_unit,
+    "Rs": rs_unit,
+    "pi": pi_unit,
+    "Boi": boi_unit,
+    "Bgi": bgi_unit,
+    "Rsi": rsi_unit,
+    "Swc": swc_unit,
+    "Cw": cw_unit,
+    "Cf": cf_unit,
+}
 
 if uploaded is None:
     st.info("Upload the provided Excel input template or a workbook with the required production/PVT and initial-parameter sheets.")
-    st.markdown("**Required production/PVT columns:** `p`, `Np`, `Gp`, `Bo`, `Bg`, `Rs`.\n\n**Required initial parameters:** `pi`, `Boi`, `Bgi`, `Rsi`, `Swc`, `Cw`, `Cf`.")
-    st.markdown("Use the supplied template to avoid header and unit mismatches. The workbook must contain a production sheet and a separate Parameter/Value table.")
+    st.markdown(
+        "**Required production/PVT columns:** `p`, `Np`, `Gp`, `Bo`, `Bg`, `Rs`.\n\n"
+        "**Required initial parameters:** `pi`, `Boi`, `Bgi`, `Rsi`, `Swc`, `Cw`, `Cf`."
+    )
+    st.markdown(
+        "The unit selectors in the sidebar let you use common field and engineering units. "
+        "All uploaded values are converted internally to psi, STB, scf, rb/STB, rb/scf, "
+        "scf/STB, saturation fraction, and psi⁻¹ before calculation."
+    )
     st.stop()
 
 try:
     production, params, production_sheet, parameter_sheet = read_input_workbook(uploaded)
+    _, canonical_params, selected_units = convert_inputs_to_canonical(production, params, input_units)
     calc, result = calculate_havlena_odeh(
-        production, params, gas_unit=gas_unit, include_compressibility=use_compressibility
+        production,
+        params,
+        include_compressibility=use_compressibility,
+        input_units=input_units,
     )
 except Exception as exc:
     st.error(f"Could not process the uploaded workbook: {exc}")
     st.stop()
 
 st.success(f"Loaded production sheet **{production_sheet}** and parameter sheet **{parameter_sheet}**.")
+st.info(
+    "Input units converted internally to: p/pi = psi; Np = STB; Gp = scf; "
+    "Bo/Boi = rb/STB; Bg/Bgi = rb/scf; Rs/Rsi = scf/STB; Swc = fraction; Cw/Cf = psi⁻¹. "
+    "The unit selections apply to every value in the corresponding field."
+)
 
 # Headline results
 N = result["N_STB"]
@@ -160,17 +204,21 @@ with tab_plot:
 
 with tab_table:
     st.subheader("Calculated terms for each Excel row")
-    st.caption("Rows not used in the regression are retained and marked with an exclusion reason.")
-    preferred = [
-        "Excel row", "p", "Np", "Gp", "Gp_scf_used", "Bo", "Bg", "Rs", "Rp_scf_per_STB",
-        "F_rb", "Eo_rb_per_STB", "Eg_rb_per_STB", "Efw0_rb_per_STB",
-        "Expansion_denominator", "HO_x", "HO_y", "Fitted_HO_y", "Residual", "Included", "Reason",
-    ]
-    st.dataframe(calc[preferred], use_container_width=True, hide_index=True)
+    st.caption("Displayed pressure, production, FVF, and GOR values are shown after conversion to the dashboard's canonical units. Rows not used in regression are retained and marked with an exclusion reason.")
+    st.dataframe(calc, use_container_width=True, hide_index=True)
     excluded = calc.loc[~calc["Included"]]
     if not excluded.empty:
         with st.expander("Show excluded rows"):
             st.dataframe(excluded[["Excel row", "p", "Np", "Gp", "Reason"]], use_container_width=True, hide_index=True)
+    with st.expander("Selected workbook units and internal units"):
+        unit_rows = [
+            ("p", p_unit, "psi"), ("Np", np_unit, "STB"), ("Gp", gp_unit, "scf"),
+            ("Bo", bo_unit, "rb/STB"), ("Bg", bg_unit, "rb/scf"), ("Rs", rs_unit, "scf/STB"),
+            ("pi", pi_unit, "psi"), ("Boi", boi_unit, "rb/STB"), ("Bgi", bgi_unit, "rb/scf"),
+            ("Rsi", rsi_unit, "scf/STB"), ("Swc", swc_unit, "fraction"),
+            ("Cw", cw_unit, "psi⁻¹"), ("Cf", cf_unit, "psi⁻¹"),
+        ]
+        st.dataframe(pd.DataFrame(unit_rows, columns=["Input field", "Selected workbook unit", "Calculation unit"]), hide_index=True, use_container_width=True)
 
 with tab_method:
     st.subheader("Equations used")
@@ -193,18 +241,17 @@ with tab_method:
         - No aquifer influx: **We = 0**.
         - Produced water is neglected: **Wp = 0**. The supplied data do not include Wp or Bw.
         - No water or gas injection is modelled.
-        - Pressure is average reservoir pressure in psi; Cw and Cf must be in psi⁻¹.
-        - Np is in STB; Gp is interpreted using the selected gas unit; Rs is in scf/STB; Bo/Boi are in rb/STB; Bg/Bgi are in rb/scf.
+        - All selected workbook units are converted to canonical calculation units before computing material-balance terms.
         - The analysis is intended for a conventional oil reservoir with an initial gas cap and data that follow the assumed material-balance model.
         - At least three valid depleted-state rows are required. The initial point (commonly Np = 0) is not a regression point.
         """
     )
     st.subheader("Data-quality notes")
     st.write(
-        f"Initial parameters read from the workbook: pi={params['pi']:,.4g} psi, "
-        f"Boi={params['Boi']:,.6g} rb/STB, Bgi={params['Bgi']:,.6g} rb/scf, "
-        f"Rsi={params['Rsi']:,.4g} scf/STB, Swc={params['Swc']:,.4g}, "
-        f"Cw={params['Cw']:.4g} psi⁻¹, Cf={params['Cf']:.4g} psi⁻¹."
+        f"Initial parameters after conversion: pi={canonical_params['pi']:,.6g} psi; "
+        f"Boi={canonical_params['Boi']:.8g} rb/STB; Bgi={canonical_params['Bgi']:.8g} rb/scf; "
+        f"Rsi={canonical_params['Rsi']:,.6g} scf/STB; Swc={canonical_params['Swc']:.6g}; "
+        f"Cw={canonical_params['Cw']:.6g} psi⁻¹; Cf={canonical_params['Cf']:.6g} psi⁻¹."
     )
     st.markdown(
         "**Method reference:** [whitson⁺ — Static Material Balance](https://manual.whitson.com/modules/material-balance/static_mb/) "
